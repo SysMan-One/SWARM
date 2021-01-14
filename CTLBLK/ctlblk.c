@@ -75,7 +75,8 @@ int	g_exit_flag = 0,				/* Global flag 'all must to be stop'	*/
 	g_trace = 1,					/* A flag to produce extensible logging	*/
 
 	g_primary = 0,					/* Set instance as primary master */
-	g_logsize = 0;					/* A size of the log file in octets */
+	g_logsize = 0,					/* A size of the log file in octets */
+	g_cbtmo = 7;					/* A TTL of CB record in the table */
 
 int	g_metric = 0,					/* A local metric of the CB instance ,
 							** 0 - this instance is a Primary Master
@@ -101,6 +102,7 @@ OPTS optstbl [] =
 	{$ASCINI("master"),	&g_primary, 0,		OPTS$K_OPT},
 
 	{$ASCINI("signet"),	&q_signet, 0,		OPTS$K_STR},
+	{$ASCINI("cbtmo"),	&g_cbtmo, 0,		OPTS$K_INT},
 
 	OPTS_NULL
 };
@@ -338,6 +340,161 @@ struct ip_mreq	mreq = {0};
 	return	$LOG(STS$K_SUCCESS, "[#%d]Linked with multicast group %s", g_signet_sd, inet_ntoa(mreq.imr_multiaddr));
 }
 
+
+
+#define		SWARM$K_MAXCB	128			/* It's enough for demonstration purpose */
+#define		SWARM$K_MAXCL	128			/* It's enough for demonstration purpose */
+
+static struct	cb_rec	{				/* Record to keep information about of control block instances */
+	struct sockaddr_in	addr;
+	struct timespec		last;
+		int	state,
+			metric;
+} g_cb_tbl [ SWARM$K_MAXCB ];
+static	int g_cb_tbl_nr = 0;				/* A number of elements in the CB table */
+
+static struct	cl_rec	{				/* Record to keep info about clients */
+	struct sockaddr_in	addr;
+	struct timespec		last;
+
+		int	state,
+			temperature,
+			light;
+
+} g_cl_tbl [ SWARM$K_MAXCL ];
+static	int g_cl_tbl_nr = 0;				/* A number of elements in the CL table */
+
+
+static inline void	__cb_tbl_creif	(
+		SWARM_PDU *pdu,
+		struct sockaddr_in *addr
+				)
+{
+int	i;
+struct	cb_rec	*prec;
+
+	/* Run over the CB table ... */
+	for ( i = 0, prec = g_cb_tbl; i < g_cb_tbl_nr; i++, prec++)
+		{
+		if ( !memcmp(&prec->addr, addr, sizeof(struct sockaddr_in)) )
+			{
+			/* Update existen record */
+			prec->metric = ntohl(pdu->cb.metric);
+			clock_gettime(CLOCK_REALTIME, &prec->last);
+
+			prec->state =  SWARM$K_STATE_UP;
+
+			return;
+			}
+		}
+
+	/* Is there free space in the table ?
+	 * No - just return
+	 */
+	if ( i > SWARM$K_MAXCB )
+		return;
+
+	/* Fill new record with data */
+	prec->addr = *addr;
+	prec->metric = ntohl(pdu->cb.metric);
+	clock_gettime(CLOCK_REALTIME, &prec->last);
+
+	prec->state = SWARM$K_STATE_UP;
+}
+
+
+static inline void	__cb_tbl_check	( void )
+{
+int	i;
+struct	cb_rec	*prec;
+struct timespec now, delta = {g_cbtmo, 0};
+
+	/* We suppose to check record's last update time against current_time-cbtmo */
+	clock_gettime(CLOCK_REALTIME, &now);
+	__util$sub_time(&now, &delta, &now);
+
+	/* Run over the CB table ... */
+	for ( i = 0, prec = g_cb_tbl; i < g_cl_tbl_nr; i++, prec++)
+		{
+		if ( 0 > __util$cmp_time(&prec->last, &now) )
+			prec->state = SWARM$K_STATE_DOWN;
+		}
+}
+
+
+
+static inline void	__cl_tbl_creif	(
+		SWARM_PDU *pdu,
+		struct sockaddr_in *addr
+				)
+{
+int	i;
+struct	cl_rec	*prec;
+
+	/* Run over the CB table ... */
+	for ( i = 0, prec = g_cl_tbl; i < g_cl_tbl_nr; i++, prec++)
+		{
+		if ( !memcmp(&prec->addr, addr, sizeof(struct sockaddr_in)) )
+			{
+			/* Update existen record */
+			prec->temperature = pdu->cl.temperature;
+			prec->light = pdu->cl.light;
+
+			clock_gettime(CLOCK_REALTIME, &prec->last);
+
+			return;
+			}
+		}
+
+	/* Is there free space in the table ?
+	 * No - just return
+	 */
+	if ( i > SWARM$K_MAXCB )
+		return;
+
+	/* Fill new record with data */
+	prec->temperature = pdu->cl.temperature;
+	prec->light = pdu->cl.light;
+
+	clock_gettime(CLOCK_REALTIME, &prec->last);
+}
+
+
+static inline void	__cl_tbl_check	( void )
+{
+int	i;
+struct	cl_rec	*prec;
+struct timespec now, delta = {g_cbtmo, 0};
+
+	/* We suppose to check record's last update time against current_time-cbtmo */
+	clock_gettime(CLOCK_REALTIME, &now);
+	__util$sub_time(&now, &delta, &now);
+
+	/* Run over the CB table ... */
+	for ( i = 0, prec = g_cl_tbl; i < g_cb_tbl_nr; i++, prec++)
+		{
+		if ( 0 > __util$cmp_time(&prec->last, &now) )
+			prec->state = SWARM$K_STATE_DOWN;
+		}
+}
+
+
+
+
+
+
+/*
+ *   DESCRIPTION: Handle all incoming packets is comming over the multicast from CB and CL instances.
+ *	maintain Client and Control Block tables.
+ *
+ *    INPUTS:
+ *	NONE
+ *
+ *   OUTPUT:
+ *	NONE
+ *
+ */
+
 int	th_in	(void *arg)
 {
 int	rc;
@@ -370,30 +527,89 @@ int	slen = sizeof(struct sockaddr_in);
 			continue;
 			}
 
-		/* Sanity checks ... */
-		if ( memcmp(pdu->magic, g_magic, SWARM$SZ_MAGIC) )		/* Non-matched magic - just ignore packet */
-			continue;
 
-		if ( rc != (SWARM$SZ_PDUHDR +  ntohs(pdu->len)) )		/* Payload is not consistent - ignore */
+		$DUMPHEX(buf, rc);
+
+
+		/* Sanity checks ... */
+		if ( memcmp(&pdu->magic, &g_magic, SWARM$SZ_MAGIC) )		/* Non-matched magic - just ignore packet */
 			continue;
 
 		switch ( ntohs(pdu->req) )
 			{
 			case	SWARM$K_REQ_CB_UP:				/* Cre/Upd CB instance record */
-			case	SWARM$K_REQ_CB_DOWN:				/* Del  CB instance record */
-			case	SWARM$K_REQ_CL_DATASET:				/* Cre/update dataset record of the Client */
+				__cb_tbl_creif(pdu, &rsock);
+				break;
 
-			default:
-				rc = ntohs(pdu->req);
-				$LOG(STS$C_ERROR, "[#%d] Ignore illegal/unhandled request code=%d/%x", rc, rc);
+
+			case	SWARM$K_REQ_CL_DATASET:				/* Cre/update dataset record of the Client */
+				__cl_tbl_creif(pdu, &rsock);
+
+			default:						/* Just ignore unknown/unhandled request */
 				continue;
 			}
-
-
-
 		}
 
 }
+
+
+
+
+
+
+/*
+ *   DESCRIPTION: Handle all incoming packets is comming over the multicast from CB and CL instances.
+ *	maintain Client and Control Block tables.
+ *
+ *    INPUTS:
+ *	NONE
+ *
+ *   OUTPUT:
+ *	NONE
+ *
+ */
+
+int	th_out	(void *arg)
+{
+int	rc, len;
+struct pollfd pfd = {g_signet_sd, POLLIN, 0};
+char	buf[512];
+SWARM_PDU	*pdu = (SWARM_PDU *) buf;
+struct	sockaddr_in rsock = {0};
+int	slen = sizeof(struct sockaddr_in);
+
+
+	while ( !g_exit_flag)
+		{
+		memset(buf, 0, sizeof(buf));
+		memcpy(&pdu->magic, g_magic, SWARM$SZ_MAGIC);
+
+		/* Form and fill request : "We are UP & Running PDU" */
+		pdu->req = htons(SWARM$K_REQ_CB_UP);
+
+		pdu->cb.metric = htonl(g_metric);
+
+		if ( len !=  (rc = sendto(g_signet_sd, pdu, len = sizeof(SWARM_PDU), 0, &g_signet, slen)) )
+			$LOG(STS$K_ERROR, "[#%d] sendto(%d octets)->%d, errno=%d", g_signet_sd, len, rc, errno);
+
+
+		/* Form and fill request : "Send to CB actual data" */
+		pdu->req = htons(SWARM$K_REQ_CB_DATAREQ);
+
+		if (len !=  (rc = sendto(g_signet_sd, pdu, len = sizeof(SWARM_PDU), 0, &g_signet, slen)) )
+			$LOG(STS$K_ERROR, "[#%d] sendto(%d octets)->%d, errno=%d", g_signet_sd, len, rc, errno);
+
+		/* Prepare data to send all clients */
+
+
+
+
+		/* Sleep for X seconds before next run ... */
+		for ( rc = 5; rc = sleep(rc); );
+		}
+
+}
+
 
 
 int	main	(int argc, char* argv[])
@@ -429,7 +645,8 @@ pthread_t	tid;
 
 
 	/* Start main capture thread ... */
-	//status = pthread_create(&tid, NULL, __th_pcap_loop, NULL);
+	status = pthread_create(&tid, NULL, th_in, NULL);
+	status = pthread_create(&tid, NULL, th_out, NULL);
 
 	/* Loop, eat, sleep ... */
 	while ( !g_exit_flag )
