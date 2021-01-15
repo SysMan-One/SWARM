@@ -24,9 +24,10 @@ extern "C" {
 
 /* A list of control codes/requests is supposed to be used to carry control/data information over wires */
 enum {
-	SWARM$K_REQ_CB_UP,				/* Contorl Block instance is UP and Running */
-	SWARM$K_REQ_CB_DATAREQ,				/* Contorl Block request data set from Client */
-	SWARM$K_REQ_CL_DATASET,				/* A data set from Client */
+	SWARM$K_REQ_UP,					/* Contorl Block instance is UP and Running */
+	SWARM$K_REQ_DATAREQ,				/* Contorl Block request data set from Client */
+	SWARM$K_REQ_PARAMS,				/* A Data Set from Client */
+	SWARM$K_REQ_SETDATA,				/* A set of data to be send to a Client */
 
 	SWARM$K_REQ_EOL					/* End-Of-List marker */
 };

@@ -38,20 +38,18 @@
 #endif
 
 
-#define _GNU_SOURCE
+#include	<stdio.h>
+#include	<stdlib.h>
 #include	<signal.h>
-#include	<sched.h>
-#include	<sys/types.h>
-#include	<sys/stat.h>
 #include	<errno.h>
 #include	<netinet/in.h>
-#include	<netinet/ip.h>
 #include	<netinet/udp.h>
-#include	<sys/time.h>
 #include	<time.h>
 #include	<sys/socket.h>
 #include	<arpa/inet.h>
 #include	<poll.h>
+#include	<pthread.h>
+#include	<unistd.h>
 
 /*
 * Defines and includes for enable extend trace and logging
@@ -78,6 +76,8 @@ int	g_exit_flag = 0,				/* Global flag 'all must to be stop'	*/
 	g_logsize = 0,					/* A size of the log file in octets */
 	g_cbtmo = 7;					/* A TTL of CB record in the table */
 
+
+
 int	g_metric = 0,					/* A local metric of the CB instance ,
 							** 0 - this instance is a Primary Master
 							*/
@@ -90,7 +90,7 @@ int			g_signet_sd = -1;		/* A socket descriptior for the UDP multicasting */
 struct sockaddr_in	g_signet = {0};
 
 
-const char g_magic [SWARM$SZ_MAGIC] = "$StarLet";
+const char g_magic [SWARM$SZ_MAGIC] = "$StarLet";	/* A magic is supposed to be used as fingerprint of the SWARM PDU */
 
 
 OPTS optstbl [] =
@@ -106,137 +106,6 @@ OPTS optstbl [] =
 
 	OPTS_NULL
 };
-
-
-
-/* Follow stuff are for debug/development purpose only	*/
-
-typedef	struct __sym_rec__ {
-	unsigned long long	val;		/* binary value or mask		*/
-	unsigned char		len, *sym;	/* ASCII counted string		*/
-} SYM_REC;
-
-#define	$SYM_REC_INI(s) {s, sizeof(#s)-1, #s}
-#define	$SYM_REC_EOL	{0, 0, NULL}
-
-static SYM_REC	__ip_protos_vals [] = {
-
-	$SYM_REC_INI( IPPROTO_ICMP),
-	$SYM_REC_INI( IPPROTO_IGMP),
-	$SYM_REC_INI( IPPROTO_IPIP),
-	$SYM_REC_INI( IPPROTO_TCP),
-	$SYM_REC_INI( IPPROTO_EGP),
-	$SYM_REC_INI( IPPROTO_PUP),
-	$SYM_REC_INI( IPPROTO_UDP),
-	$SYM_REC_INI( IPPROTO_IDP),
-	$SYM_REC_INI( IPPROTO_TP),
-	$SYM_REC_INI( IPPROTO_DCCP),
-	$SYM_REC_INI( IPPROTO_IPV6),
-	$SYM_REC_INI( IPPROTO_RSVP),
-	$SYM_REC_INI( IPPROTO_GRE),
-	$SYM_REC_INI( IPPROTO_ESP),
-	$SYM_REC_INI( IPPROTO_AH),
-	$SYM_REC_INI( IPPROTO_MTP ),
-	$SYM_REC_INI( IPPROTO_BEETPH ),
-	$SYM_REC_INI( IPPROTO_ENCAP ),
-	$SYM_REC_INI( IPPROTO_PIM),
-	$SYM_REC_INI( IPPROTO_COMP),
-	$SYM_REC_INI( IPPROTO_SCTP),
-	$SYM_REC_INI( IPPROTO_UDPLITE),
-	$SYM_REC_INI( IPPROTO_MPLS),
-
-	$SYM_REC_EOL		/* EOL	*/
-};
-
-
-/**
- * @brief __util$mask2sym - translate mask of bits to human readable ASCII string
- *
- * @param dst	- mask, 64-bits unsigned long long
- * @param tbl	- a table of bit = bit's name
- * @param src	- a buffer to accept output
- * @param srcsz	- a size of the buffer
- *
- * @return	- length of actual data in the output buffer
- */
-static int	mask2sym	(
-	unsigned long long	 mask,
-		SYM_REC		*tbl,
-		unsigned char	*out,
-			int	 outsz
-			)
-{
-int	outlen = 0;
-SYM_REC	*sym = tbl;
-
-	for ( sym = tbl; sym->val && sym->sym; sym++)
-		{
-		if ( !(mask & sym->val) )
-			continue;
-
-		if ( outsz > sym->len )
-			{
-			if ( outlen )
-				{
-				*(out++) = '|';
-				outlen++;
-				outsz--;
-				}
-
-			memcpy(out, sym->sym, sym->len);
-			out	+= sym->len;
-			outlen	+= sym->len;
-			outsz	-= sym->len;
-			}
-		else	break;
-		}
-
-	*out = '\0';
-
-	return	outlen;
-}
-
-
-/**
- * @brief __util$val2sym - translate value to human readable ASCII string
- *
- * @param dst	- value, 64-bits unsigned long long
- * @param tbl	- a table of bit = bit's name
- * @param src	- a buffer to accept output
- * @param srcsz	- a size of the buffer
- *
- * @return	- length of actual data in the output buffer
- */
-static int	val2sym	(
-	unsigned long long	 val,
-		SYM_REC		*tbl,
-		unsigned char	*out,
-			int	 outsz
-			)
-{
-int	outlen = 0;
-SYM_REC	*sym = tbl;
-
-	for ( sym = tbl; sym->len && sym->sym; sym++)
-		{
-		if ( (val != sym->val) )
-			continue;
-
-		if ( outsz > sym->len )
-			{
-			memcpy(out, sym->sym, sym->len);
-			out	+= sym->len;
-			outlen	+= sym->len;
-
-			break;
-			}
-		}
-
-	*out = '\0';
-
-	return	outlen;
-}
-
 
 
 /*
@@ -351,7 +220,7 @@ static struct	cb_rec	{				/* Record to keep information about of control block i
 		int	state,
 			metric;
 } g_cb_tbl [ SWARM$K_MAXCB ];
-static	int g_cb_tbl_nr = 0;				/* A number of elements in the CB table */
+static	volatile int g_cb_tbl_nr = 0;				/* A number of elements in the CB table */
 
 static struct	cl_rec	{				/* Record to keep info about clients */
 	struct sockaddr_in	addr;
@@ -362,7 +231,7 @@ static struct	cl_rec	{				/* Record to keep info about clients */
 			light;
 
 } g_cl_tbl [ SWARM$K_MAXCL ];
-static	int g_cl_tbl_nr = 0;				/* A number of elements in the CL table */
+static	volatile int g_cl_tbl_nr = 0;				/* A number of elements in the CL table */
 
 
 static inline void	__cb_tbl_creif	(
@@ -480,6 +349,40 @@ struct timespec now, delta = {g_cbtmo, 0};
 
 
 
+static inline int	__cl_tbl_calc	(
+		int	*temperature,
+		int	*light
+				)
+{
+int	i;
+struct	cl_rec	*prec;
+
+	/* Preset to zero output arguments */
+	*temperature = *light = 0;
+
+	if ( !g_cl_tbl_nr )
+		return	STS$K_WARN;
+
+
+	/* Run over the CB table ... */
+	for ( i = 0, prec = g_cl_tbl; i < g_cb_tbl_nr; i++, prec++)
+		{
+		/* Process only active Client's record */
+		if ( !(prec->state = SWARM$K_STATE_UP) )
+			continue;
+
+
+		*temperature += prec->temperature;
+		*light += prec->light;
+		}
+
+	*temperature /= i;
+	*light /= i;
+
+	return	STS$K_SUCCESS;
+}
+
+
 
 
 
@@ -503,10 +406,17 @@ char	buf[512];
 SWARM_PDU	*pdu = (SWARM_PDU *) &buf[sizeof(struct udphdr)];
 struct	sockaddr_in rsock = {0};
 int	slen = sizeof(struct sockaddr_in);
-
+struct timespec now, last, delta = {g_cbtmo, 0};
 
 	while ( !g_exit_flag)
 		{
+		clock_gettime(CLOCK_REALTIME, &now);
+		__util$sub_time(&now, &delta, &now);
+
+		__cb_tbl_check();						/* Scan for expired CB records */
+		__cl_tbl_check();						/* Scan for expired Client records */
+
+
 		/* Wait for input packets ... */
 		if( 0 >  (rc = poll(&pfd, 1, 1000)) && (errno != EINTR) )
 			return	$LOG(STS$K_ERROR, "[#%d] poll/select()->%d, errno=%d", pfd.fd, rc, errno);
@@ -537,12 +447,15 @@ int	slen = sizeof(struct sockaddr_in);
 
 		switch ( ntohs(pdu->req) )
 			{
-			case	SWARM$K_REQ_CB_UP:				/* Cre/Upd CB instance record */
+			case	SWARM$K_REQ_UP:					/* Cre/Upd CB instance record */
 				__cb_tbl_creif(pdu, &rsock);
 				break;
 
+			case	SWARM$K_REQ_DATAREQ:				/* Got Data Request from other CB instance ? */
+				__cl_tbl_creif(pdu, &rsock);			/* recompute our own status */
 
-			case	SWARM$K_REQ_CL_DATASET:				/* Cre/update dataset record of the Client */
+
+			case	SWARM$K_REQ_SETDATA:				/* Cre/update dataset record of the Client */
 				__cl_tbl_creif(pdu, &rsock);
 
 			default:						/* Just ignore unknown/unhandled request */
@@ -550,6 +463,9 @@ int	slen = sizeof(struct sockaddr_in);
 			}
 		}
 
+
+	pthread_exit(NULL);
+	return	STS$K_SUCCESS;
 }
 
 
@@ -571,43 +487,58 @@ int	slen = sizeof(struct sockaddr_in);
 
 int	th_out	(void *arg)
 {
-int	rc, len;
+int	rc, temperature, light, i;
 struct pollfd pfd = {g_signet_sd, POLLIN, 0};
-char	buf[512];
-SWARM_PDU	*pdu = (SWARM_PDU *) buf;
-struct	sockaddr_in rsock = {0};
-int	slen = sizeof(struct sockaddr_in);
+SWARM_PDU	pdu = {0};
+socklen_t	slen = sizeof(struct sockaddr_in);
+const int	pdusz = sizeof(SWARM_PDU);
 
-
-	while ( !g_exit_flag)
+	for ( i = 0;  !g_exit_flag; i++ )
 		{
-		memset(buf, 0, sizeof(buf));
-		memcpy(&pdu->magic, g_magic, SWARM$SZ_MAGIC);
+		memset(&pdu, 0, sizeof(pdu));
+		memcpy(&pdu.magic, g_magic, SWARM$SZ_MAGIC);
 
 		/* Form and fill request : "We are UP & Running PDU" */
-		pdu->req = htons(SWARM$K_REQ_CB_UP);
+		pdu.req = htons(SWARM$K_REQ_UP);
 
-		pdu->cb.metric = htonl(g_metric);
+		pdu.cb.metric = htonl(g_metric);
 
-		if ( len !=  (rc = sendto(g_signet_sd, pdu, len = sizeof(SWARM_PDU), 0, &g_signet, slen)) )
-			$LOG(STS$K_ERROR, "[#%d] sendto(%d octets)->%d, errno=%d", g_signet_sd, len, rc, errno);
+		if ( pdusz !=  (rc = sendto(g_signet_sd, &pdu, pdusz, 0, &g_signet, slen)) )
+			$LOG(STS$K_ERROR, "[#%d] sendto(%d octets)->%d, errno=%d", g_signet_sd, pdusz, rc, errno);
 
 
 		/* Form and fill request : "Send to CB actual data" */
-		pdu->req = htons(SWARM$K_REQ_CB_DATAREQ);
+		pdu.req = htons(SWARM$K_REQ_DATAREQ);
 
-		if (len !=  (rc = sendto(g_signet_sd, pdu, len = sizeof(SWARM_PDU), 0, &g_signet, slen)) )
-			$LOG(STS$K_ERROR, "[#%d] sendto(%d octets)->%d, errno=%d", g_signet_sd, len, rc, errno);
+		if (pdusz !=  (rc = sendto(g_signet_sd, &pdu, pdusz, 0, &g_signet, slen)) )
+			$LOG(STS$K_ERROR, "[#%d] sendto(%d octets)->%d, errno=%d", g_signet_sd, pdusz, rc, errno);
 
 		/* Prepare data to send all clients */
+		if ( 1 & __cl_tbl_calc (&temperature, &light) )
+			{
+			/* Form and fill request : "Display a new set of data" */
 
+			pdu.req = htons(SWARM$K_REQ_SETDATA);
 
+			snprintf(pdu.cl.text, sizeof(pdu.cl.text) - 1, "[#%d] Temp=%d, Light=%d", i, temperature, light);
+
+			clock_gettime(CLOCK_REALTIME, &pdu.cl.tm);
+			*((unsigned long long *) &pdu.cl.tm)  = htobe64(*((unsigned long long *) &pdu.cl.tm));
+
+			pdu.cl.temperature = htonl(temperature);
+			pdu.cl.light = htonl(light);
+
+			if (pdusz !=  (rc = sendto(g_signet_sd, &pdu, pdusz, 0, &g_signet, slen)) )
+				$LOG(STS$K_ERROR, "[#%d] sendto(%d octets)->%d, errno=%d", g_signet_sd, pdusz, rc, errno);
+			}
 
 
 		/* Sleep for X seconds before next run ... */
 		for ( rc = 5; rc = sleep(rc); );
 		}
 
+	pthread_exit(NULL);
+	return	STS$K_SUCCESS;
 }
 
 
