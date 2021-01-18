@@ -69,7 +69,7 @@ ASC	q_logfspec = {0},
 
 
 
-int	g_exit_flag = 0,				/* Global flag 'all must to be stop'	*/
+volatile int	g_exit_flag = 0,			/* Global flag 'all must to be stop'	*/
 	g_trace = 1,					/* A flag to produce extensible logging	*/
 
 	g_primary = 0,					/* Set instance as primary master */
@@ -78,11 +78,15 @@ int	g_exit_flag = 0,				/* Global flag 'all must to be stop'	*/
 
 
 
-int	g_metric = 0,					/* A local metric of the CB instance ,
+volatile unsigned g_metric = 0,				/* A local metric of the CB instance ,
 							** 0 - this instance is a Primary Master
 							*/
 
-	g_master = 0;
+	g_master = 0;					/* This is a dynamicaly changed  value
+							  defines current instance mode:
+							  0 - SLAVE
+							  1 - PRIMARY/BACKUP MASTER mode
+							*/
 
 
 
@@ -106,6 +110,33 @@ OPTS optstbl [] =
 
 	OPTS_NULL
 };
+
+
+
+
+#define		SWARM$K_MAXCB	128			/* It's enough for demonstration purpose */
+#define		SWARM$K_MAXCL	128			/* It's enough for demonstration purpose */
+
+static struct	cb_rec	{				/* Record to keep information about of control block instances */
+	struct sockaddr_in	addr;
+	struct timespec		last;
+		unsigned	state,
+				metric;
+} g_cb_tbl [ SWARM$K_MAXCB ];
+static	volatile int g_cb_tbl_nr = 0;			/* A number of elements in the CB table */
+
+static struct	cl_rec	{				/* Record to keep info about clients */
+	struct sockaddr_in	addr;
+	struct timespec		last;
+
+		unsigned	state;
+		int		temperature,
+				light;
+
+} g_cl_tbl [ SWARM$K_MAXCL ];
+static	volatile int g_cl_tbl_nr = 0;			/* A number of elements in the CL table */
+
+
 
 
 /*
@@ -143,16 +174,23 @@ char	host[256] = {0}, buf[256] = {0};
 	g_signet.sin_family = AF_INET;
 	g_signet.sin_port   = htons(port);
 
-
-	/* Compute a local "metrtic" it's shoud be an unique across the swarm's nodes */
+	/* Compute a local "metric" it's should be an unique across the swarm's nodes */
 	if ( g_primary )
+		{
+		/* This instance is administratively set to PRIMARY/MASTER mode */
 		g_metric = 0;
+		g_master = SWARM$K_STATE_UP;
+		}
 	else	{
+		/* Slave mode */
 		struct timespec tp = {0};
 
 		clock_gettime(CLOCK_MONOTONIC, &tp);
 		g_metric = tp.tv_nsec;
+		g_master = SWARM$K_STATE_DOWN;
 		}
+
+	$LOG(STS$K_INFO, "Local metric is %d, master mode is %s", g_metric, g_master ? "ON" : "OFF");
 
 
 	return	STS$K_SUCCESS;
@@ -206,34 +244,33 @@ struct ip_mreq	mreq = {0};
 		return	$LOG(STS$K_ERROR, "setsockopt(%d)->%d, errno=%d", g_signet_sd, status, errno);
 		}
 
-	return	$LOG(STS$K_SUCCESS, "[#%d]Linked with multicast group %s", g_signet_sd, inet_ntoa(mreq.imr_multiaddr));
+	return	$LOG(STS$K_SUCCESS, "[#%d] Linked with multicast group %s", g_signet_sd, inet_ntoa(mreq.imr_multiaddr));
 }
 
 
-
-#define		SWARM$K_MAXCB	128			/* It's enough for demonstration purpose */
-#define		SWARM$K_MAXCL	128			/* It's enough for demonstration purpose */
-
-static struct	cb_rec	{				/* Record to keep information about of control block instances */
-	struct sockaddr_in	addr;
-	struct timespec		last;
-		int	state,
-			metric;
-} g_cb_tbl [ SWARM$K_MAXCB ];
-static	volatile int g_cb_tbl_nr = 0;				/* A number of elements in the CB table */
-
-static struct	cl_rec	{				/* Record to keep info about clients */
-	struct sockaddr_in	addr;
-	struct timespec		last;
-
-		int	state,
-			temperature,
-			light;
-
-} g_cl_tbl [ SWARM$K_MAXCL ];
-static	volatile int g_cl_tbl_nr = 0;				/* A number of elements in the CL table */
-
-
+/*
+ *   DESCRIPTION: Create new or update existen record for Control Block instance
+ *	in the global CB table.
+ *
+ *   INPUTS:
+ *	pdu:	A SWARM PDU with CB data
+ *	addr:	A network address of the CB instance
+ *
+ *   IMPLICITE INPUTS:
+ *	g_cb_tbl
+ *	g_cb_tbl_nr
+ *
+ *   OUTPUT:
+ *	NONE
+ *
+ *   IMPLICITE OUTPUTS:
+ *
+ *	g_cb_tbl
+ *	g_cb_tbl_nr
+ *
+ *   RETURNS:
+ *	NONE
+ */
 static inline void	__cb_tbl_creif	(
 		SWARM_PDU *pdu,
 		struct sockaddr_in *addr
@@ -271,10 +308,30 @@ struct	cb_rec	*prec;
 	prec->state = SWARM$K_STATE_UP;
 }
 
-
+/*
+ *   DESCRIPTION: Scan global CB table for expired records and turn them OFF;
+ *	change state of this instance to BACKUP MASTER based on metrics comparison.
+ *	This routine is supposed to be called at regular interval.
+ *
+ *   INPUTS:
+ *	NONE
+ *
+ *   IMPLICITE INPUTS:
+ *	g_cb_tbl
+ *	g_cb_tbl_nr
+ *
+ *   OUTPUT:
+ *	NONE
+ *
+ *   IMPLICITE OUTPUTS:
+ *	g_master
+ *
+ *   RETURNS:
+ *	NONE
+ */
 static inline void	__cb_tbl_check	( void )
 {
-int	i;
+int	i, metric = 0;
 struct	cb_rec	*prec;
 struct timespec now, delta = {g_cbtmo, 0};
 
@@ -287,11 +344,53 @@ struct timespec now, delta = {g_cbtmo, 0};
 		{
 		if ( 0 > __util$cmp_time(&prec->last, &now) )
 			prec->state = SWARM$K_STATE_DOWN;
+
+		metric = (metric > prec->metric) ? metric : prec->metric;
+		}
+
+	/* Follows checks only for non-PRIMARY MASTER instances */
+	if ( g_metric )
+		{
+		/* Do we need to switch our state of MASTER ? */
+		if ( (g_metric > metric) && (g_master != SWARM$K_STATE_UP) )
+			{
+			g_master = SWARM$K_STATE_UP;
+			$LOG (STS$C_INFO, "Switch our state to BACKUP MASTER is ON");
+			}
+		/* We is BACKUP MASTER ? May be there is a MASTER with better metric ? */
+		else if ( (g_metric <= metric) && (g_master == SWARM$K_STATE_UP) )
+			{
+			g_master = SWARM$K_STATE_DOWN;
+			$LOG (STS$C_INFO, "Switch our state to BACKUP MASTER is OFF");
+			}
 		}
 }
 
 
 
+/*
+ *   DESCRIPTION: Create new or update existen record for Client (Indication Block) instance
+ *	in the global CL table.
+ *
+ *   INPUTS:
+ *	pdu:	A SWARM PDU with CL data
+ *	addr:	A network address of the CL instance
+ *
+ *   IMPLICITE INPUTS:
+ *	g_cl_tbl
+ *	g_cl_tbl_nr
+ *
+ *   OUTPUT:
+ *	NONE
+ *
+ *   IMPLICITE OUTPUTS:
+ *
+ *	g_cl_tbl
+ *	g_cl_tbl_nr
+ *
+ *   RETURNS:
+ *	NONE
+ */
 static inline void	__cl_tbl_creif	(
 		SWARM_PDU *pdu,
 		struct sockaddr_in *addr
@@ -318,7 +417,7 @@ struct	cl_rec	*prec;
 	/* Is there free space in the table ?
 	 * No - just return
 	 */
-	if ( i > SWARM$K_MAXCB )
+	if ( i > SWARM$K_MAXCL )
 		return;
 
 	/* Fill new record with data */
@@ -328,6 +427,20 @@ struct	cl_rec	*prec;
 	clock_gettime(CLOCK_REALTIME, &prec->last);
 }
 
+/*
+ *   DESCRIPTION: Scan global CL table for expired records and turn them OFF;
+ *	This routine is supposed to be called at regular interval.
+ *
+ *   IMPLICITE INPUTS:
+ *	g_cl_tbl
+ *	g_cl_tbl_nr
+ *
+ *   IMPLICITE OUTPUTS:
+ *	g_cl_tbl
+ *
+ *   RETURNS:
+ *	NONE
+ */
 
 static inline void	__cl_tbl_check	( void )
 {
@@ -348,13 +461,29 @@ struct timespec now, delta = {g_cbtmo, 0};
 }
 
 
-
+/*
+ *   DESCRIPTION: Perform computation of average vlues for temperature and light intensity
+ *	across all active (bob-expired) CL records.
+ *
+ *   IMPLICITE INPUTS:
+ *	g_cl_tbl
+ *	g_cl_tbl_nr
+ *
+ *   OUTPUT:
+ *	temperature:	average temperature
+ *	light:		light intensity
+ *
+ *   RETURNS:
+ *	condition code
+ *	STS$K_WARN - no data in te table (table is empty)
+ *	STS$K_SUCCESS
+ */
 static inline int	__cl_tbl_calc	(
 		int	*temperature,
 		int	*light
 				)
 {
-int	i;
+int	i, nr;
 struct	cl_rec	*prec;
 
 	/* Preset to zero output arguments */
@@ -365,7 +494,7 @@ struct	cl_rec	*prec;
 
 
 	/* Run over the CB table ... */
-	for ( i = 0, prec = g_cl_tbl; i < g_cb_tbl_nr; i++, prec++)
+	for ( nr = i = 0, prec = g_cl_tbl; i < g_cb_tbl_nr; i++, prec++)
 		{
 		/* Process only active Client's record */
 		if ( !(prec->state = SWARM$K_STATE_UP) )
@@ -374,10 +503,15 @@ struct	cl_rec	*prec;
 
 		*temperature += prec->temperature;
 		*light += prec->light;
+		nr++;
 		}
 
-	*temperature /= i;
-	*light /= i;
+	if ( !nr )
+		return	STS$K_WARN;
+
+
+	*temperature /= nr;
+	*light /= nr;
 
 	return	STS$K_SUCCESS;
 }
@@ -433,7 +567,7 @@ struct timespec now, last, delta = {g_cbtmo, 0};
 
 		if ( (0 >= rc) && (errno != EINPROGRESS) )
 			{
-			$LOG(STS$K_ERROR, "[#%d] recv(1 octet)->%d, .revents=%08x(%08x), errno=%d", pfd.fd, rc, pfd.revents, pfd.events, errno);
+			$LOG(STS$K_ERROR, "[#%d] recv()->%d, .revents=%08x(%08x), errno=%d", pfd.fd, rc, pfd.revents, pfd.events, errno);
 			continue;
 			}
 
@@ -488,7 +622,6 @@ struct timespec now, last, delta = {g_cbtmo, 0};
 int	th_out	(void *arg)
 {
 int	rc, temperature, light, i;
-struct pollfd pfd = {g_signet_sd, POLLIN, 0};
 SWARM_PDU	pdu = {0};
 socklen_t	slen = sizeof(struct sockaddr_in);
 const int	pdusz = sizeof(SWARM_PDU);
@@ -497,6 +630,8 @@ const int	pdusz = sizeof(SWARM_PDU);
 		{
 		memset(&pdu, 0, sizeof(pdu));
 		memcpy(&pdu.magic, g_magic, SWARM$SZ_MAGIC);
+
+
 
 		/* Form and fill request : "We are UP & Running PDU" */
 		pdu.req = htons(SWARM$K_REQ_UP);
@@ -513,23 +648,31 @@ const int	pdusz = sizeof(SWARM_PDU);
 		if (pdusz !=  (rc = sendto(g_signet_sd, &pdu, pdusz, 0, &g_signet, slen)) )
 			$LOG(STS$K_ERROR, "[#%d] sendto(%d octets)->%d, errno=%d", g_signet_sd, pdusz, rc, errno);
 
-		/* Prepare data to send all clients */
-		if ( 1 & __cl_tbl_calc (&temperature, &light) )
+
+
+		/*
+		 * Follow works is performed if this instance in the PRIMARY/BACKUP MASTER mode
+		 */
+		if ( g_master )
 			{
-			/* Form and fill request : "Display a new set of data" */
+			/* Prepare data to send all clients */
+			if ( 1 & __cl_tbl_calc (&temperature, &light) )
+				{
+				/* Form and fill request : "Display a new set of data" */
 
-			pdu.req = htons(SWARM$K_REQ_SETDATA);
+				pdu.req = htons(SWARM$K_REQ_SETDATA);
 
-			snprintf(pdu.cl.text, sizeof(pdu.cl.text) - 1, "[#%d] Temp=%d, Light=%d", i, temperature, light);
+				snprintf(pdu.cl.text, sizeof(pdu.cl.text) - 1, "[#%d] Temp=%d, Light=%d", i, temperature, light);
 
-			clock_gettime(CLOCK_REALTIME, &pdu.cl.tm);
-			*((unsigned long long *) &pdu.cl.tm)  = htobe64(*((unsigned long long *) &pdu.cl.tm));
+				clock_gettime(CLOCK_REALTIME, &pdu.cl.tm);
+				*((unsigned long long *) &pdu.cl.tm)  = htobe64(*((unsigned long long *) &pdu.cl.tm));
 
-			pdu.cl.temperature = htonl(temperature);
-			pdu.cl.light = htonl(light);
+				pdu.cl.temperature = htonl(temperature);
+				pdu.cl.light = htonl(light);
 
-			if (pdusz !=  (rc = sendto(g_signet_sd, &pdu, pdusz, 0, &g_signet, slen)) )
-				$LOG(STS$K_ERROR, "[#%d] sendto(%d octets)->%d, errno=%d", g_signet_sd, pdusz, rc, errno);
+				if (pdusz !=  (rc = sendto(g_signet_sd, &pdu, pdusz, 0, &g_signet, slen)) )
+					$LOG(STS$K_ERROR, "[#%d] sendto(%d octets)->%d, errno=%d", g_signet_sd, pdusz, rc, errno);
+				}
 			}
 
 
@@ -565,27 +708,28 @@ pthread_t	tid;
 	if ( g_trace )
 		__util$showparams(optstbl);
 
-
 	if ( !(1 & config_validate()) )
 		return	-1;
 
 
+	/* Initialize networking stuff ... */
 	if ( !(1 & signet_init()) )
 		return	-1;
 
 
 
-	/* Start main capture thread ... */
+	/* Startthreads for send request and process incoming data */
 	status = pthread_create(&tid, NULL, th_in, NULL);
 	status = pthread_create(&tid, NULL, th_out, NULL);
 
 	/* Loop, eat, sleep ... */
 	while ( !g_exit_flag )
 		{
-
 		for ( status = 3; status = sleep(status); );
 		}
 
 
+
+	$LOG(STS$C_INFO, "Shutdown with exit flag %d", g_exit_flag);
 	return(0);
 }
