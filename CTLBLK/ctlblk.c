@@ -103,9 +103,10 @@ OPTS optstbl [] =
 
 	{$ASCINI("trace"),	&g_trace, 0,		OPTS$K_OPT},
 	{$ASCINI("logfile"),	&q_logfspec, ASC$K_SZ,	OPTS$K_STR},
+	{$ASCINI("logsize"),	&g_logsize, 0,		OPTS$K_INT},
 	{$ASCINI("master"),	&g_primary, 0,		OPTS$K_OPT},
 
-	{$ASCINI("signet"),	&q_signet, 0,		OPTS$K_STR},
+	{$ASCINI("signet"),	&q_signet, ASC$K_SZ,	OPTS$K_STR},
 	{$ASCINI("cbtmo"),	&g_cbtmo, 0,		OPTS$K_INT},
 
 	OPTS_NULL
@@ -355,13 +356,13 @@ struct timespec now, delta = {g_cbtmo, 0};
 		if ( (g_metric > metric) && (g_master != SWARM$K_STATE_UP) )
 			{
 			g_master = SWARM$K_STATE_UP;
-			$LOG (STS$C_INFO, "Switch our state to BACKUP MASTER is ON");
+			$LOG (STS$K_INFO, "Switch our state to BACKUP MASTER is ON");
 			}
 		/* We is BACKUP MASTER ? May be there is a MASTER with better metric ? */
 		else if ( (g_metric <= metric) && (g_master == SWARM$K_STATE_UP) )
 			{
 			g_master = SWARM$K_STATE_DOWN;
-			$LOG (STS$C_INFO, "Switch our state to BACKUP MASTER is OFF");
+			$LOG (STS$K_INFO, "Switch our state to BACKUP MASTER is OFF");
 			}
 		}
 }
@@ -536,7 +537,7 @@ int	th_in	(void *arg)
 {
 int	rc;
 struct pollfd pfd = {g_signet_sd, POLLIN, 0};
-char	buf[512];
+char	buf[512], ipbuf[32];
 SWARM_PDU	*pdu = (SWARM_PDU *) &buf[sizeof(struct udphdr)];
 struct	sockaddr_in rsock = {0};
 int	slen = sizeof(struct sockaddr_in);
@@ -571,13 +572,13 @@ struct timespec now, last, delta = {g_cbtmo, 0};
 			continue;
 			}
 
-
-		$DUMPHEX(buf, rc);
-
-
 		/* Sanity checks ... */
 		if ( memcmp(&pdu->magic, &g_magic, SWARM$SZ_MAGIC) )		/* Non-matched magic - just ignore packet */
 			continue;
+
+
+		inet_ntop(AF_INET, &rsock, ipbuf, sizeof(ipbuf));
+		$LOG(STS$K_SUCCESS, "[#%d] Got PDU from %s:%d, req=%d", pfd.fd, ipbuf, ntohs(rsock.sin_port), ntohs(pdu->req));
 
 		switch ( ntohs(pdu->req) )
 			{
@@ -587,10 +588,11 @@ struct timespec now, last, delta = {g_cbtmo, 0};
 
 			case	SWARM$K_REQ_DATAREQ:				/* Got Data Request from other CB instance ? */
 				__cl_tbl_creif(pdu, &rsock);			/* recompute our own status */
-
+				break;
 
 			case	SWARM$K_REQ_SETDATA:				/* Cre/update dataset record of the Client */
 				__cl_tbl_creif(pdu, &rsock);
+				break;
 
 			default:						/* Just ignore unknown/unhandled request */
 				continue;
@@ -730,6 +732,6 @@ pthread_t	tid;
 
 
 
-	$LOG(STS$C_INFO, "Shutdown with exit flag %d", g_exit_flag);
+	$LOG(STS$K_INFO, "Shutdown with exit flag %d", g_exit_flag);
 	return(0);
 }

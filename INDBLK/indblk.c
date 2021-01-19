@@ -1,4 +1,4 @@
-﻿#define	__MODULE__	"INDBLK"
+#define	__MODULE__	"INDBLK"
 #define	__IDENT__	"X.00-02"
 #define	__REV__		"0.02.0"
 
@@ -90,11 +90,19 @@ OPTS optstbl [] =
 
 	{$ASCINI("trace"),	&g_trace, 0,		OPTS$K_OPT},
 	{$ASCINI("logfile"),	&q_logfspec, ASC$K_SZ,	OPTS$K_STR},
+	{$ASCINI("logsize"),	&g_logsize, 0,		OPTS$K_INT},
 
-	{$ASCINI("signet"),	&q_signet, 0,		OPTS$K_STR},
+	{$ASCINI("signet"),	&q_signet, ASC$K_SZ,	OPTS$K_STR},
 
 	OPTS_NULL
 };
+
+/* Global Client/Indication Block parameters */
+ASC	g_disptext = {0};				/* Last gotten text from CB */
+int	g_temperature,					/* Local temperature */
+	g_light;					/* Light intensivity */
+struct timespec g_tm;					/* Time stamp from CB */
+
 
 
 
@@ -204,23 +212,16 @@ int	th_in	(void *arg)
 {
 int	rc;
 struct pollfd pfd = {g_signet_sd, POLLIN, 0};
-char	buf[512];
+char	buf[2048];
 SWARM_PDU	*pdu = (SWARM_PDU *) &buf[sizeof(struct udphdr)];
 struct	sockaddr_in rsock = {0};
 int	slen = sizeof(struct sockaddr_in);
-struct timespec now, last, delta = {g_cbtmo, 0};
+const int	pdusz = sizeof(SWARM_PDU);
 
 	while ( !g_exit_flag)
 		{
-		clock_gettime(CLOCK_REALTIME, &now);
-		__util$sub_time(&now, &delta, &now);
-
-		__cb_tbl_check();						/* Scan for expired CB records */
-		__cl_tbl_check();						/* Scan for expired Client records */
-
-
 		/* Wait for input packets ... */
-		if( 0 >  (rc = poll(&pfd, 1, 1000)) && (errno != EINTR) )
+		if( 0 >  (rc = poll(&pfd, 1, 3000)) && (errno != EINTR) )
 			return	$LOG(STS$K_ERROR, "[#%d] poll/select()->%d, errno=%d", pfd.fd, rc, errno);
 		else if ( (rc < 0) && (errno == EINTR) )
 			{
@@ -240,24 +241,36 @@ struct timespec now, last, delta = {g_cbtmo, 0};
 			}
 
 
-		$DUMPHEX(buf, rc);
-
-
 		/* Sanity checks ... */
 		if ( memcmp(&pdu->magic, &g_magic, SWARM$SZ_MAGIC) )		/* Non-matched magic - just ignore packet */
 			continue;
 
 		switch ( ntohs(pdu->req) )
 			{
-			case	SWARM$K_REQ_DATAREQ:				/* Got Data Request from other CB instance ? */
-				__cl_tbl_creif(pdu, &rsock);			/* recompute our own status */
+			case	SWARM$K_REQ_DATAREQ:				/* CB request local data to send */
+				memset(pdu, 0, sizeof(SWARM_PDU));
+				memcpy(pdu->magic, g_magic, SWARM$SZ_MAGIC);
 
+				/* Form and fill request : "Our parameters is ! " */
+				pdu->req = htons(SWARM$K_REQ_PARAMS);
 
-			case	SWARM$K_REQ_SETDATA:				/* Cre/update dataset record of the Client */
-				__cl_tbl_creif(pdu, &rsock);
+				pdu->cl.temperature = htonl(g_temperature);
+				pdu->cl.temperature = htonl(g_light);
 
-			default:						/* Just ignore unknown/unhandled request */
-				continue;
+				if ( pdusz !=  (rc = sendto(g_signet_sd, pdu, pdusz, 0, &g_signet, slen)) )
+					$LOG(STS$K_ERROR, "[#%d] sendto(%d octets)->%d, errno=%d", g_signet_sd, pdusz, rc, errno);
+
+				break;
+
+			case	SWARM$K_REQ_SETDATA:				/* Got data to be display */
+				__util$str2asc(pdu->cl.text, &g_disptext);
+				g_tm.tv_sec = ntohl(pdu->cl.tm.tv_sec);
+				g_tm.tv_nsec = ntohl(pdu->cl.tm.tv_nsec);
+
+				break;
+
+			default:
+				break;
 			}
 		}
 
@@ -265,62 +278,6 @@ struct timespec now, last, delta = {g_cbtmo, 0};
 	pthread_exit(NULL);
 	return	STS$K_SUCCESS;
 }
-
-
-
-
-
-
-/*
- *   DESCRIPTION: Handle all incoming packets is comming over the multicast from CB and CL instances.
- *	maintain Client and Control Block tables.
- *
- *    INPUTS:
- *	NONE
- *
- *   OUTPUT:
- *	NONE
- *
- */
-
-int	th_out	(void *arg)
-{
-int	rc, temperature, light, i;
-SWARM_PDU	pdu = {0};
-socklen_t	slen = sizeof(struct sockaddr_in);
-const int	pdusz = sizeof(SWARM_PDU);
-
-	for ( i = 0;  !g_exit_flag; i++ )
-		{
-		memset(&pdu, 0, sizeof(pdu));
-		memcpy(&pdu.magic, g_magic, SWARM$SZ_MAGIC);
-
-
-
-		/* Form and fill request : "We are UP & Running PDU" */
-		pdu.req = htons(SWARM$K_REQ_UP);
-
-		pdu.cb.metric = htonl(g_metric);
-
-		if ( pdusz !=  (rc = sendto(g_signet_sd, &pdu, pdusz, 0, &g_signet, slen)) )
-			$LOG(STS$K_ERROR, "[#%d] sendto(%d octets)->%d, errno=%d", g_signet_sd, pdusz, rc, errno);
-
-
-		/* Form and fill request : "Send to CB actual data" */
-		pdu.req = htons(SWARM$K_REQ_DATAREQ);
-
-		if (pdusz !=  (rc = sendto(g_signet_sd, &pdu, pdusz, 0, &g_signet, slen)) )
-			$LOG(STS$K_ERROR, "[#%d] sendto(%d octets)->%d, errno=%d", g_signet_sd, pdusz, rc, errno);
-
-
-		/* Sleep for X seconds before next run ... */
-		for ( rc = 5; rc = sleep(rc); );
-		}
-
-	pthread_exit(NULL);
-	return	STS$K_SUCCESS;
-}
-
 
 
 int	main	(int argc, char* argv[])
@@ -357,16 +314,20 @@ pthread_t	tid;
 
 	/* Startthreads for send request and process incoming data */
 	status = pthread_create(&tid, NULL, th_in, NULL);
-	status = pthread_create(&tid, NULL, th_out, NULL);
 
 	/* Loop, eat, sleep ... */
 	while ( !g_exit_flag )
 		{
+		/* Just for demonstration purpose ... */
+		g_temperature = rand() % 40;
+		g_light = rand() % 40;
+
+		$LOG(STS$K_INFO, "Display='%.*s', Temp=%dC, Light=%d(Lumen)", $ASC(&g_disptext), g_temperature, g_light);
+
 		for ( status = 3; status = sleep(status); );
 		}
 
 
-
-	$LOG(STS$C_INFO, "Shutdown with exit flag %d", g_exit_flag);
+	$LOG(STS$K_INFO, "Shutdown with exit flag %d", g_exit_flag);
 	return(0);
 }
