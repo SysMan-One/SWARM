@@ -10,7 +10,7 @@
 while : 
 
 do
-        $EXEDIR/yadpi -config=$EXEDIR/yadpi.conf
+        $EXEDIR/indblk -config=$EXEDIR/indblk.conf
 
         stv=$?
 

@@ -10,7 +10,7 @@
 while : 
 
 do
-        $EXEDIR/yadpi -config=$EXEDIR/yadpi.conf
+        $EXEDIR/ctlblk -config=$EXEDIR/ctlblk.conf
 
         stv=$?
 

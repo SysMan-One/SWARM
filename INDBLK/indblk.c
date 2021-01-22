@@ -67,7 +67,7 @@
 							/* A storage for global configuration options */
 ASC	q_logfspec = {0},
 	q_confspec = {0},
-	q_signet = {$ASCINI("224.1.1.0:1234")};
+	q_signet = {$ASCINI("224.1.1.1:1234")};
 
 
 
@@ -78,10 +78,9 @@ volatile int	g_exit_flag = 0,			/* Global flag 'all must to be stop'	*/
 
 
 int			g_signet_sd = -1;		/* A socket descriptior for the UDP multicasting */
-struct sockaddr_in	g_signet = {0};
+struct sockaddr_in	g_signet_sk = {0};
 
-
-const char g_magic [SWARM$SZ_MAGIC] = "$StarLet";	/* A magic is supposed to be used as fingerprint of the SWARM PDU */
+volatile unsigned	g_instance_id = 0;		/* An Instance ID of CB/IB/Client */
 
 
 OPTS optstbl [] =
@@ -122,6 +121,7 @@ int	config_validate	(void)
 {
 int	port = 0;
 char	host[256] = {0}, buf[256] = {0};
+struct timespec tp = {0};
 
 	/*
 	 * Validate & parse /SIGNET=<ip:port> pair
@@ -135,11 +135,15 @@ char	host[256] = {0}, buf[256] = {0};
 	/*
 	 * Initialize assotiated with the multicast network socket structure
 	 */
-	if ( !inet_pton(AF_INET, host, &g_signet.sin_addr) )
+	if ( !inet_pton(AF_INET, host, &g_signet_sk.sin_addr) )
 		return  $LOG(STS$K_ERROR, "Cannot convert '%s' to internal representative", host);
 
-	g_signet.sin_family = AF_INET;
-	g_signet.sin_port   = htons(port);
+	g_signet_sk.sin_family = AF_INET;
+	g_signet_sk.sin_port   = htons(port);
+
+
+	clock_gettime(CLOCK_MONOTONIC, &tp);
+	g_instance_id = tp.tv_nsec;
 
 	return	STS$K_SUCCESS;
 }
@@ -165,7 +169,7 @@ int	signet_init	( void )
 int	status, on = 1;
 struct ip_mreq	mreq = {0};
 
-	mreq.imr_multiaddr.s_addr = g_signet.sin_addr.s_addr;
+	mreq.imr_multiaddr.s_addr = g_signet_sk.sin_addr.s_addr;
 
 	/*
 	 * Allocate socket descriptor (sd), bind sd to socket
@@ -177,7 +181,7 @@ struct ip_mreq	mreq = {0};
 		$LOG(STS$K_WARN, "setsockopt(%d, SO_REUSEADDR) : %s", g_signet_sd, strerror(errno));
 	else	$IFTRACE(g_trace, __TFAC__ __TFAC__ "setsockopt(%d, SO_REUSEADDR) :  SUCCESS", g_signet_sd);
 
-	if ( status = bind(g_signet_sd, (struct sockaddr *)&g_signet, sizeof(g_signet)) )
+	if ( status = bind(g_signet_sd, (struct sockaddr *)&g_signet_sk, sizeof(g_signet_sk)) )
 		{
 		close(g_signet_sd);
 		return	$LOG(STS$K_ERROR, "bind(%d, ...)->%d, errno=%d", g_signet_sd, status, errno);
@@ -212,8 +216,8 @@ int	th_in	(void *arg)
 {
 int	rc;
 struct pollfd pfd = {g_signet_sd, POLLIN, 0};
-char	buf[2048];
-SWARM_PDU	*pdu = (SWARM_PDU *) &buf[sizeof(struct udphdr)];
+char	buf[2048], ipbuf[32];
+SWARM_PDU	*pdu = (SWARM_PDU *) buf;
 struct	sockaddr_in rsock = {0};
 int	slen = sizeof(struct sockaddr_in);
 const int	pdusz = sizeof(SWARM_PDU);
@@ -242,22 +246,26 @@ const int	pdusz = sizeof(SWARM_PDU);
 
 
 		/* Sanity checks ... */
-		if ( memcmp(&pdu->magic, &g_magic, SWARM$SZ_MAGIC) )		/* Non-matched magic - just ignore packet */
+		if ( memcmp(&pdu->magic, SWARM$T_MAGIC, SWARM$SZ_MAGIC) )	/* Non-matched magic - just ignore packet */
 			continue;
+
+		inet_ntop(AF_INET, &rsock.sin_addr, ipbuf, sizeof(ipbuf));
+		$LOG(STS$K_SUCCESS, "[#%d] Got PDU from id=%04x %s:%d, req=%d", pfd.fd, ntohl(pdu->id), ipbuf, ntohs(rsock.sin_port), ntohs(pdu->req));
 
 		switch ( ntohs(pdu->req) )
 			{
 			case	SWARM$K_REQ_DATAREQ:				/* CB request local data to send */
 				memset(pdu, 0, sizeof(SWARM_PDU));
-				memcpy(pdu->magic, g_magic, SWARM$SZ_MAGIC);
+				memcpy(pdu->magic, SWARM$T_MAGIC, SWARM$SZ_MAGIC);
 
 				/* Form and fill request : "Our parameters is ! " */
 				pdu->req = htons(SWARM$K_REQ_PARAMS);
+				pdu->id = htonl(g_instance_id);
 
 				pdu->cl.temperature = htonl(g_temperature);
-				pdu->cl.temperature = htonl(g_light);
+				pdu->cl.light = htonl(g_light);
 
-				if ( pdusz !=  (rc = sendto(g_signet_sd, pdu, pdusz, 0, &g_signet, slen)) )
+				if ( pdusz !=  (rc = sendto(g_signet_sd, pdu, pdusz, 0, &g_signet_sk, slen)) )
 					$LOG(STS$K_ERROR, "[#%d] sendto(%d octets)->%d, errno=%d", g_signet_sd, pdusz, rc, errno);
 
 				break;
@@ -320,11 +328,11 @@ pthread_t	tid;
 		{
 		/* Just for demonstration purpose ... */
 		g_temperature = rand() % 40;
-		g_light = rand() % 40;
+		g_light = rand() % 99;
 
-		$LOG(STS$K_INFO, "Display='%.*s', Temp=%dC, Light=%d(Lumen)", $ASC(&g_disptext), g_temperature, g_light);
+		$LOG(STS$K_INFO, "Display='%.*s', Temp=%d(C), Light=%d(Lumen)", $ASC(&g_disptext), g_temperature, g_light);
 
-		for ( status = 3; status = sleep(status); );
+		for ( struct timespec tmo = {7, 0}; nanosleep(&tmo, &tmo); );
 		}
 
 

@@ -11,6 +11,8 @@
 **
 **  MODIFICATION HISTORY:
 **
+**	22-JAN-2021	RRL	Added Instance Id into the SWARM PDU to designate PDU originator
+**
 **--
 */
 
@@ -22,10 +24,13 @@ extern "C" {
 #endif
 
 
+#define		SWARM$K_PRIMASTER	0xffFFffFFUL
+
+
 /* A list of control codes/requests is supposed to be used to carry control/data information over wires */
 enum {
-	SWARM$K_REQ_UP,					/* Contorl Block instance is UP and Running */
-	SWARM$K_REQ_DATAREQ,				/* Contorl Block request data set from Client */
+	SWARM$K_REQ_UP = 0,				/* Control Block instance is UP and Running */
+	SWARM$K_REQ_DATAREQ,				/* Control Block request data set from Client */
 	SWARM$K_REQ_PARAMS,				/* A Data Set from Client */
 	SWARM$K_REQ_SETDATA,				/* A set of data to be send to a Client */
 
@@ -40,19 +45,20 @@ enum	{
 };
 
 #define	SWARM$SZ_MAGIC	8
-#define	SWARM$T_MAGIC	"StarLet"
+#define	SWARM$T_MAGIC	"$StarLet"
 
 #pragma	pack (push, 1)
 
 typedef	struct  __swarm_pdu__ {
-	unsigned long long	magic;			/* NBO, A magic constant is supposed to be used to filtering non-relevant packets */
+	unsigned char	magic[SWARM$SZ_MAGIC];		/* NBO, A magic constant is supposed to be used to filtering non-relevant packets */
 	unsigned short	req;				/* NBO, Request code, see SWARM$K_REQ_* constants */
+	unsigned	id;				/* Instance Id */
 
 	union {
 	unsigned char	data[0];			/* A plaiceholder of the payload part of the PDU */
 
 	struct {
-		int	metric;
+		unsigned metric;
 		} cb;
 
 
