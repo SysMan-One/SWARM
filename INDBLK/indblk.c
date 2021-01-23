@@ -1,6 +1,6 @@
 #define	__MODULE__	"INDBLK"
-#define	__IDENT__	"X.00-02"
-#define	__REV__		"0.02.0"
+#define	__IDENT__	"X.00-03"
+#define	__REV__		"0.03.0"
 
 #ifdef	__GNUC__
 	#ident			__IDENT__
@@ -33,7 +33,8 @@
 **
 **  MODIFICATION HISTORY:
 **
-**--
+**	23-JAN-2021	RRL	X.00-03 :  Improved local temperature and light parameters generation.
+**
 */
 
 #ifndef	__ARCH__NAME__
@@ -72,7 +73,7 @@ ASC	q_logfspec = {0},
 
 
 volatile int	g_exit_flag = 0,			/* Global flag 'all must to be stop'	*/
-	g_trace = 1,					/* A flag to produce extensible logging	*/
+	g_trace = 0,					/* A flag to produce extensible logging	*/
 
 	g_logsize = 0;					/* A size of the log file in octets */
 
@@ -108,10 +109,10 @@ struct timespec g_tm;					/* Time stamp from CB */
 /*
  *   DESCRIPTION: Perform additional parsing of complex options and validate.
  *
- *   IMPLICTE INPUTS:
+ *   IMPLICITE INPUTS:
  *	....
  *
- *   IMPLICTE OUTPUTS:
+ *   IMPLICITE OUTPUTS:
  *
  *
  *   RETURNS:
@@ -154,13 +155,13 @@ struct timespec tp = {0};
  *
  *  Description: Initalize a socket  and binding it to a given multicast group.
  *
- *  Imlicit input:
+ *  IMLICITE INPUTS:
  *	runparams:	configuration vector
  *
- *  Output:
+ *  OUTPUTS:
  *	sock:		A socket descriptor
  *
- *  Return:
+ *  RETURNS:
  *	condition code
  *
  */
@@ -207,7 +208,7 @@ struct ip_mreq	mreq = {0};
  *    INPUTS:
  *	NONE
  *
- *   OUTPUT:
+ *   OUTPUTS:
  *	NONE
  *
  */
@@ -250,11 +251,13 @@ const int	pdusz = sizeof(SWARM_PDU);
 			continue;
 
 		inet_ntop(AF_INET, &rsock.sin_addr, ipbuf, sizeof(ipbuf));
-		$LOG(STS$K_SUCCESS, "[#%d] Got PDU from id=%04x %s:%d, req=%d", pfd.fd, ntohl(pdu->id), ipbuf, ntohs(rsock.sin_port), ntohs(pdu->req));
+		$IFTRACE(g_trace, "[#%d] Got PDU from id=%04x %s:%d, req=%d", pfd.fd, ntohl(pdu->id), ipbuf, ntohs(rsock.sin_port), ntohs(pdu->req));
 
 		switch ( ntohs(pdu->req) )
 			{
 			case	SWARM$K_REQ_DATAREQ:				/* CB request local data to send */
+				$LOG(STS$K_INFO, "[#%d] Got DATAREQ from id=%04x %s:%d, req=%d", pfd.fd, ntohl(pdu->id), ipbuf, ntohs(rsock.sin_port), ntohs(pdu->req));
+
 				memset(pdu, 0, sizeof(SWARM_PDU));
 				memcpy(pdu->magic, SWARM$T_MAGIC, SWARM$SZ_MAGIC);
 
@@ -271,6 +274,8 @@ const int	pdusz = sizeof(SWARM_PDU);
 				break;
 
 			case	SWARM$K_REQ_SETDATA:				/* Got data to be display */
+				$LOG(STS$K_INFO, "[#%d] Got SETDATA from id=%04x %s:%d, req=%d", pfd.fd, ntohl(pdu->id), ipbuf, ntohs(rsock.sin_port), ntohs(pdu->req));
+
 				__util$str2asc(pdu->cl.text, &g_disptext);
 				g_tm.tv_sec = ntohl(pdu->cl.tm.tv_sec);
 				g_tm.tv_nsec = ntohl(pdu->cl.tm.tv_nsec);
@@ -290,7 +295,7 @@ const int	pdusz = sizeof(SWARM_PDU);
 
 int	main	(int argc, char* argv[])
 {
-int	status;
+int	status, seed, nr;
 pthread_t	tid;
 
 	$LOG(STS$K_INFO, "Rev: " __IDENT__ "/"  __ARCH__NAME__   ", (built  at "__DATE__ " " __TIME__ " with CC " __VERSION__ ")");
@@ -318,10 +323,16 @@ pthread_t	tid;
 	if ( !(1 & signet_init()) )
 		return	-1;
 
-
-
 	/* Startthreads for send request and process incoming data */
 	status = pthread_create(&tid, NULL, th_in, NULL);
+
+
+	/* A stuff for random ... */
+	nr = seed = getpid();
+
+	srand(seed);
+	for (nr &= 0xFFff; nr--;)
+		status =  rand();
 
 	/* Loop, eat, sleep ... */
 	while ( !g_exit_flag )

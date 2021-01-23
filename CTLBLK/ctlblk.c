@@ -1,6 +1,6 @@
 ﻿#define	__MODULE__	"CTLBLK"
-#define	__IDENT__	"X.00-02"
-#define	__REV__		"0.02.0"
+#define	__IDENT__	"X.00-03"
+#define	__REV__		"0.03.0"
 
 #ifdef	__GNUC__
 	#ident			__IDENT__
@@ -25,11 +25,11 @@
 **
 **  AUTHORS: Ruslan R. (The BadAss SysMan) Laishev
 **
-**  CREATION DATE:  17-FEB-2020
+**  CREATION DATE:  12-JAN-2021
 **
 **  MODIFICATION HISTORY:
 **
-**	 2-NOV-2020	RRL	Recoded using AVL Tree API (LIBAVL).
+**	23-JAN-2021	RRL	X.00-03 : Recoded timeout checking for PRIMARY MASTER
 **--
 */
 
@@ -75,7 +75,7 @@ volatile int	g_exit_flag = 0,			/* Global flag 'all must to be stop'	*/
 	g_primary = 0,					/* Set instance as primary master */
 	g_logsize = 0,					/* A size of the log file in octets */
 	g_cbtmo = 7,					/* A TTL of CB record in the table */
-	g_voteint = 60*5;				/* Time before revoting of master */
+	g_primatmo = 60*5;				/* Time before revoting of master */
 
 
 
@@ -109,7 +109,7 @@ OPTS optstbl [] =
 
 	{$ASCINI("signet"),	&q_signet, ASC$K_SZ,	OPTS$K_STR},
 	{$ASCINI("cbtmo"),	&g_cbtmo, 0,		OPTS$K_INT},
-	{$ASCINI("voteint"),	&g_voteint, 0,		OPTS$K_INT},
+	{$ASCINI("primatmo"),	&g_primatmo, 0,		OPTS$K_INT},
 
 	OPTS_NULL
 };
@@ -147,10 +147,10 @@ static	volatile int g_cl_tbl_nr = 0;			/* A number of elements in the CL table *
 /*
  *   DESCRIPTION: Perform additional parsing of complex options and validate.
  *
- *   IMPLICTE INPUTS:
+ *   IMPLICITE INPUTS:
  *	....
  *
- *   IMPLICTE OUTPUTS:
+ *   IMPLICITE OUTPUTS:
  *
  *
  *   RETURNS:
@@ -209,13 +209,13 @@ struct timespec tp = {0};
  *
  *  Description: Initalize a socket  and binding it to a given multicast group.
  *
- *  Imlicit input:
+ *  IMLICITE INPUT:
  *	runparams:	configuration vector
  *
- *  Output:
+ *  OUTPUTs:
  *	sock:		A socket descriptor
  *
- *  Return:
+ *  RETURNS:
  *	condition code
  *
  */
@@ -267,7 +267,7 @@ struct ip_mreq	mreq = {0};
  *	g_cb_tbl
  *	g_cb_tbl_nr
  *
- *   OUTPUT:
+ *   OUTPUTS:
  *	NONE
  *
  *   IMPLICITE OUTPUTS:
@@ -330,7 +330,7 @@ struct	cb_rec	*prec;
  *	g_cb_tbl
  *	g_cb_tbl_nr
  *
- *   OUTPUT:
+ *   OUTPUTS:
  *	NONE
  *
  *   IMPLICITE OUTPUTS:
@@ -344,7 +344,7 @@ static inline void	__cb_tbl_check	( void )
 int	i;
 unsigned	metric = g_metric;
 struct	cb_rec	*prec;
-struct timespec now, delta = {g_cbtmo, 0};
+struct timespec now, delta = {g_cbtmo, 0}, delta2 = {g_primatmo, 0};
 char	ipbuf[32];
 
 	if ( !g_cb_tbl_nr )
@@ -352,7 +352,9 @@ char	ipbuf[32];
 
 	/* We suppose to check record's last update time against current_time-cbtmo */
 	clock_gettime(CLOCK_REALTIME, &now);
-	__util$sub_time(&now, &delta, &now);
+	__util$sub_time(&now, &delta2, &delta2);
+	__util$sub_time(&now, &delta, &delta);
+
 
 	/* Run over the CB table ... */
 	for ( i = 0, prec = g_cb_tbl; i < g_cb_tbl_nr; i++, prec++)
@@ -360,9 +362,10 @@ char	ipbuf[32];
 		inet_ntop(AF_INET, &prec->addr.sin_addr, ipbuf, sizeof(ipbuf));
 		$IFTRACE(g_trace, "[#%d] id=%04x %s:%d - metric is %d", i, prec->id, ipbuf, ntohs(prec->addr.sin_port), prec->metric);
 
-
-		if ( 0 > __util$cmp_time(&prec->last, &now) )
+		/* Check BACKUP MASTER instances .... */
+		if ( 0 > __util$cmp_time(&prec->last, (prec->id == SWARM$K_PRIMASTER) ? &delta2 : &delta) )
 			{
+			__util$sub_time(&now, &prec->last, &delta);
 			prec->state = SWARM$K_STATE_DOWN;
 			continue;
 			}
@@ -406,7 +409,7 @@ char	ipbuf[32];
  *	g_cl_tbl
  *	g_cl_tbl_nr
  *
- *   OUTPUT:
+ *   OUTPUTS:
  *	NONE
  *
  *   IMPLICITE OUTPUTS:
@@ -499,7 +502,7 @@ struct timespec now, delta = {g_cbtmo, 0};
  *	g_cl_tbl
  *	g_cl_tbl_nr
  *
- *   OUTPUT:
+ *   OUTPUTS:
  *	temperature:	average temperature
  *	light:		light intensity
  *
@@ -565,7 +568,7 @@ char	ipbuf[32];
  *   INPUTS:
  *	NONE
  *
- *   OUTPUT:
+ *   OUTPUTS:
  *	NONE
  *
  */
@@ -620,15 +623,6 @@ struct timespec now, last, delta = {g_cbtmo, 0};
 		switch ( ntohs(pdu->req) )
 			{
 			case	SWARM$K_REQ_UP:					/* Got : Instance is Up & Running PDU */
-				if ( g_primary )
-					{
-					if ( (g_instance_id != ntohl(pdu->id)) && (SWARM$K_PRIMASTER == ntohl(pdu->cb.metric))	)
-						{
-						$LOG(STS$C_WARN, "Ignore PRIMARY MASTER request from id=%04x %s:%d, req=%d", ntohl(pdu->id), ipbuf, ntohs(rsock.sin_port), ntohs(pdu->req));
-						break;
-						}
-					}
-
 				__cb_tbl_creif(pdu, &rsock);			/* Cre/Upd CB instance record */
 				break;
 
@@ -658,7 +652,7 @@ struct timespec now, last, delta = {g_cbtmo, 0};
  *    INPUTS:
  *	NONE
  *
- *   OUTPUT:
+ *   OUTPUTS:
  *	NONE
  *
  */
